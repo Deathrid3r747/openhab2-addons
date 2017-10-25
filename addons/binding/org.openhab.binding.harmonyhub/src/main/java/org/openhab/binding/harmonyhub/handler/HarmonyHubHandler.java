@@ -43,12 +43,13 @@ import org.eclipse.smarthome.core.types.RefreshType;
 import org.eclipse.smarthome.core.types.StateDescription;
 import org.eclipse.smarthome.core.types.StateOption;
 import org.openhab.binding.harmonyhub.HarmonyHubBindingConstants;
-import org.openhab.binding.harmonyhub.config.HarmonyHubConfig;
 import org.openhab.binding.harmonyhub.internal.HarmonyHubHandlerFactory;
+import org.openhab.binding.harmonyhub.internal.config.HarmonyHubConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import net.whistlingfish.harmony.ActivityChangeListener;
+import net.whistlingfish.harmony.ActivityStatusListener;
 import net.whistlingfish.harmony.HarmonyClient;
 import net.whistlingfish.harmony.HarmonyHubListener;
 import net.whistlingfish.harmony.config.Activity;
@@ -59,6 +60,7 @@ import net.whistlingfish.harmony.config.HarmonyConfig;
  * sent to one of the channels.
  *
  * @author Dan Cunningham - Initial contribution
+ * @author Pawel Pieczul - added support for hub status changes
  */
 public class HarmonyHubHandler extends BaseBridgeHandler implements HarmonyHubListener {
 
@@ -73,7 +75,7 @@ public class HarmonyHubHandler extends BaseBridgeHandler implements HarmonyHubLi
 
     private static final int HEARTBEAT_INTERVAL = 30;
 
-    private ScheduledExecutorService buttonExecutor = Executors.newSingleThreadScheduledExecutor();
+    private ScheduledExecutorService buttonExecutor;
 
     private List<HubStatusListener> listeners = new CopyOnWriteArrayList<HubStatusListener>();
 
@@ -124,14 +126,15 @@ public class HarmonyHubHandler extends BaseBridgeHandler implements HarmonyHubLi
 
     @Override
     public void initialize() {
+        buttonExecutor = Executors.newSingleThreadScheduledExecutor();
         cancelRetry();
         connect();
     }
 
     @Override
     public void dispose() {
-        listeners.clear();
         buttonExecutor.shutdownNow();
+        listeners.clear();
         cancelRetry();
         disconnectFromHub();
         factory.removeChannelTypesForThing(getThing().getUID());
@@ -172,6 +175,12 @@ public class HarmonyHubHandler extends BaseBridgeHandler implements HarmonyHubLi
                 updateState(activity);
             }
         });
+        hc.addListener(new ActivityStatusListener() {
+            @Override
+            public void activityStatusChanged(Activity activity, Activity.Status status) {
+                updateActivityStatus(activity, status);
+            }
+        });
     }
 
     /**
@@ -207,7 +216,7 @@ public class HarmonyHubHandler extends BaseBridgeHandler implements HarmonyHubLi
         try {
             logger.debug("Connecting: host {}", host);
             client.connect(host);
-            heartBeatJob = scheduler.scheduleAtFixedRate(new Runnable() {
+            heartBeatJob = scheduler.scheduleWithFixedDelay(new Runnable() {
 
                 @Override
                 public void run() {
@@ -259,6 +268,38 @@ public class HarmonyHubHandler extends BaseBridgeHandler implements HarmonyHubLi
         logger.debug("Updating current activity to {}", activity.getLabel());
         updateState(new ChannelUID(getThing().getUID(), HarmonyHubBindingConstants.CHANNEL_CURRENT_ACTIVITY),
                 new StringType(activity.getLabel()));
+    }
+
+    private void updateActivityStatus(Activity activity, Activity.Status status) {
+        logger.debug("Received {} activity status for {}", status, activity.getLabel());
+        switch (status) {
+            case ACTIVITY_IS_STARTING:
+                triggerChannel(HarmonyHubBindingConstants.CHANNEL_ACTIVITY_STARTING_TRIGGER, getEventName(activity));
+                break;
+            case ACTIVITY_IS_STARTED:
+            case HUB_IS_OFF:
+                // hub is off is received with power-off activity
+                triggerChannel(HarmonyHubBindingConstants.CHANNEL_ACTIVITY_STARTED_TRIGGER, getEventName(activity));
+                break;
+            case HUB_IS_TURNING_OFF:
+                // hub is turning off is received for current activity, we will translate it into activity starting
+                // trigger of power-off activity (with ID=-1)
+                HarmonyConfig config = getCachedConfig();
+                if (config != null) {
+                    Activity powerOff = config.getActivityById(-1);
+                    if (powerOff != null) {
+                        triggerChannel(HarmonyHubBindingConstants.CHANNEL_ACTIVITY_STARTING_TRIGGER,
+                                getEventName(powerOff));
+                    }
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    private String getEventName(Activity activity) {
+        return activity.getLabel().replaceAll("[^A-Za-z0-9]", "_");
     }
 
     private void buildChannel() {
@@ -331,14 +372,16 @@ public class HarmonyHubHandler extends BaseBridgeHandler implements HarmonyHubLi
      * @param button
      */
     public void pressButton(int device, String button) {
-        buttonExecutor.execute(new Runnable() {
-            @Override
-            public void run() {
-                if (client != null) {
-                    client.pressButton(device, button);
+        if (buttonExecutor != null && !buttonExecutor.isShutdown()) {
+            buttonExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    if (client != null) {
+                        client.pressButton(device, button);
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     /**
@@ -348,14 +391,16 @@ public class HarmonyHubHandler extends BaseBridgeHandler implements HarmonyHubLi
      * @param button
      */
     public void pressButton(String device, String button) {
-        buttonExecutor.execute(new Runnable() {
-            @Override
-            public void run() {
-                if (client != null) {
-                    client.pressButton(device, button);
+        if (buttonExecutor != null && !buttonExecutor.isShutdown()) {
+            buttonExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    if (client != null) {
+                        client.pressButton(device, button);
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     /**
